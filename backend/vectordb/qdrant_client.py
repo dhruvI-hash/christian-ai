@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance,
@@ -26,6 +27,15 @@ from config.settings import get_settings
 from rag.hybrid_search import SearchResult
 from rag.sparse_encoder import SparseVector
 from rag.stats import CollectionStats
+
+# Payload fields that must be indexed to support metadata filtering in Qdrant.
+_PAYLOAD_INDEXES: dict[str, models.PayloadSchemaType] = {
+    "book": models.PayloadSchemaType.KEYWORD,
+    "testament": models.PayloadSchemaType.KEYWORD,
+    "chapter": models.PayloadSchemaType.INTEGER,
+    "verse_start": models.PayloadSchemaType.INTEGER,
+    "verse_end": models.PayloadSchemaType.INTEGER,
+}
 
 
 @dataclass
@@ -77,6 +87,9 @@ class VectorDBClientBase(ABC):
 class QdrantVectorClient(VectorDBClientBase):
     """Qdrant Cloud/Local vector DB client."""
 
+    # Track collections whose payload indexes we've already ensured this process.
+    _indexed_collections: set[str] = set()
+
     def __init__(self):
         settings = get_settings()
         if settings.qdrant_api_key:
@@ -100,6 +113,22 @@ class QdrantVectorClient(VectorDBClientBase):
                     "sparse": SparseVectorParams(),
                 },
             )
+        self._ensure_payload_indexes(collection)
+
+    def _ensure_payload_indexes(self, collection: str) -> None:
+        """Best-effort creation of payload indexes needed for metadata filtering."""
+        if collection in self._indexed_collections:
+            return
+        for field_name, schema in _PAYLOAD_INDEXES.items():
+            try:
+                self._client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception as e:  # noqa: BLE001 — index may already exist or be read-only
+                logger.debug(f"[qdrant] payload index '{field_name}' skipped: {e}")
+        self._indexed_collections.add(collection)
 
     def _build_filter(self, filter_conditions: dict | None) -> Filter | None:
         """Build a Qdrant filter from a dict of conditions."""
@@ -170,15 +199,34 @@ class QdrantVectorClient(VectorDBClientBase):
         self._ensure_collection(collection)
         qdrant_filter = self._build_filter(filter_conditions)
 
-        # Dense search using query_points (modern Qdrant API)
-        dense_response = self._client.query_points(
-            collection_name=collection,
-            query=dense_vector,
-            using="dense",
-            limit=top_k * 2,  # Over-retrieve for better fusion
-            query_filter=qdrant_filter,
-            with_payload=True,
-        )
+        # Dense search using query_points (modern Qdrant API).
+        # If a metadata filter fails (e.g. missing index), retry unfiltered so we
+        # still return semantically relevant results instead of nothing.
+        try:
+            dense_response = self._client.query_points(
+                collection_name=collection,
+                query=dense_vector,
+                using="dense",
+                limit=top_k * 2,  # Over-retrieve for better fusion
+                query_filter=qdrant_filter,
+                with_payload=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            if qdrant_filter is not None:
+                logger.warning(
+                    f"[qdrant] filtered dense search failed ({e}); retrying unfiltered."
+                )
+                qdrant_filter = None
+                dense_response = self._client.query_points(
+                    collection_name=collection,
+                    query=dense_vector,
+                    using="dense",
+                    limit=top_k * 2,
+                    query_filter=None,
+                    with_payload=True,
+                )
+            else:
+                raise
 
         results = []
         for hit in dense_response.points:

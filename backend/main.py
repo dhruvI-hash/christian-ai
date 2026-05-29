@@ -13,14 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from config.settings import get_settings
+from config.logging_config import setup_logging
+
+# Configure logging before anything else emits logs.
+setup_logging(get_settings().log_level)
+
 from routes.chat import router as chat_router
 from routes.ingest import router as ingest_router
 from routes.rag_admin import router as rag_admin_router
 from routes.image import router as image_router
-
-# Disable agents SDK tracing to prevent getaddrinfo errors
-from agents import set_tracing_disabled
-set_tracing_disabled(True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

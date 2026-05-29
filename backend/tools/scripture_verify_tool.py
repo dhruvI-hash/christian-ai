@@ -1,41 +1,28 @@
 """
 Scripture Verify Tool — Verifies Bible verse references before citation.
-Prevents hallucination of scripture references by checking the knowledge base.
 """
 
 from __future__ import annotations
 
 import re
 
-from agents import function_tool
+from langchain_core.tools import tool
+from loguru import logger
 
 from rag.pipeline import search
+from tools.rag_tool import _current_vector_db
 
 
 def _parse_reference(reference: str) -> dict:
-    """
-    Parse a scripture reference into components.
-
-    Examples:
-        "John 3:16" → {"book": "John", "chapter": 3, "verse_start": 16}
-        "Genesis 1:1-3" → {"book": "Genesis", "chapter": 1, "verse_start": 1, "verse_end": 3}
-        "1 Corinthians 13:4" → {"book": "1 Corinthians", "chapter": 13, "verse_start": 4}
-
-    Args:
-        reference: The scripture reference string.
-
-    Returns:
-        Dict with parsed components.
-    """
+    """Parse a scripture reference into components."""
     reference = reference.strip()
 
-    # Pattern: [optional number] Book Chapter:Verse[-Verse]
     pattern = re.compile(
-        r'^(\d?\s*\w+(?:\s+\w+)?)\s+'  # Book name (with optional number prefix)
-        r'(\d+)'                         # Chapter
-        r':(\d+)'                        # Verse start
-        r'(?:-(\d+))?'                   # Optional verse end
-        r'(?:\s*\(.+\))?$'              # Optional translation in parens
+        r'^(\d?\s*\w+(?:\s+\w+)?)\s+'
+        r'(\d+)'
+        r':(\d+)'
+        r'(?:-(\d+))?'
+        r'(?:\s*\(.+\))?$'
     )
 
     match = pattern.match(reference)
@@ -53,50 +40,48 @@ def _parse_reference(reference: str) -> dict:
     return result
 
 
-@function_tool
+@tool
 async def scripture_verify_tool(
     reference: str,
     claimed_text: str = "",
 ) -> str:
-    """Verify that a Bible verse reference is accurate before citing it.
+    """Verify a Bible verse reference before citing it.
 
-    ALWAYS call this tool before stating a specific verse reference like 'John 3:16'
-    or quoting any scripture. This prevents hallucination of scripture references.
+    Always call before stating a specific reference like John 3:16 or quoting scripture.
 
     Args:
-        reference: The scripture reference to verify (e.g., "John 3:16", "Genesis 1:1-3").
-        claimed_text: Optional - the text you plan to quote. If provided, it will be
-                      compared against the actual text found.
-
-    Returns:
-        Verification result with actual text if found, or warning if not found.
+        reference: Scripture reference (e.g. John 3:16, Genesis 1:1-3).
+        claimed_text: Optional text to compare against the knowledge base.
     """
     parsed = _parse_reference(reference)
+    vector_db = _current_vector_db.get()
+    logger.info(f"[scripture_verify] reference={reference!r} | db={vector_db}")
 
-    # Build search query from the reference
     search_query = reference
     if "book" in parsed:
-        search_query = f"{parsed['book']} chapter {parsed.get('chapter', '')} verse {parsed.get('verse_start', '')}"
+        search_query = (
+            f"{parsed['book']} chapter {parsed.get('chapter', '')} "
+            f"verse {parsed.get('verse_start', '')}"
+        )
 
-    # Build filter conditions
     filter_conditions = {}
     if "book" in parsed:
         filter_conditions["book"] = parsed["book"]
     if "chapter" in parsed:
         filter_conditions["chapter"] = parsed["chapter"]
 
-    # Search the knowledge base
     results = await search(
         query=search_query,
         top_k=3,
+        vector_db=vector_db,
         filter_conditions=filter_conditions if filter_conditions else None,
     )
 
     if not results:
-        # Try a broader search without filters
-        results = await search(query=reference, top_k=3)
+        results = await search(query=reference, top_k=3, vector_db=vector_db)
 
     if not results:
+        logger.warning(f"[scripture_verify] FAILED — '{reference}' not found in KB")
         return (
             f"VERIFICATION FAILED: Reference '{reference}' was NOT found in the knowledge base. "
             "DO NOT cite this verse. Instead, say: 'I want to be careful here — I cannot verify "
@@ -107,19 +92,50 @@ async def scripture_verify_tool(
             "reference?'"
         )
 
-    # Found results — extract the most relevant text
-    best_result = results[0]
-    actual_text = best_result.text
+    # Find the result whose metadata actually matches the requested book/chapter.
+    best_result = None
+    for candidate in results:
+        meta = candidate.metadata or {}
+        cand_book = str(meta.get("book", "")).strip().lower()
+        req_book = str(parsed.get("book", "")).strip().lower()
+        if not req_book or not cand_book:
+            continue
+        book_matches = req_book in cand_book or cand_book in req_book
+        chapter_matches = (
+            "chapter" not in parsed
+            or str(meta.get("chapter", "")) == str(parsed["chapter"])
+        )
+        if book_matches and chapter_matches:
+            best_result = candidate
+            break
 
-    # Check if claimed text matches (if provided)
+    if best_result is None:
+        # We retrieved semantically related passages but none confirm the exact reference.
+        logger.warning(
+            f"[scripture_verify] UNCONFIRMED — '{reference}' not matched by metadata"
+        )
+        related = results[0]
+        related_meta = related.metadata or {}
+        related_src = related_meta.get("book", "an unlabeled passage")
+        return (
+            f"UNCONFIRMED: I could not confirm the exact reference '{reference}' in the "
+            f"knowledge base. The closest related passage is from '{related_src}', which "
+            "is NOT the same reference. Do NOT present '" + reference + "' as a verified "
+            "quote. You may discuss the theological concept, but say you could not verify "
+            "the specific reference."
+        )
+
+    actual_text = best_result.text
+    logger.info(f"[scripture_verify] VERIFIED — '{reference}' matched in KB")
+
     text_match_warning = ""
     if claimed_text:
         claimed_lower = claimed_text.lower().strip()
         actual_lower = actual_text.lower().strip()
         if claimed_lower not in actual_lower and actual_lower not in claimed_lower:
             text_match_warning = (
-                f"\nWARNING: The claimed text does not closely match the retrieved text. "
-                f"Use the retrieved text for accuracy."
+                "\nWARNING: The claimed text does not closely match the retrieved text. "
+                "Use the retrieved text for accuracy."
             )
 
     source_info = ""

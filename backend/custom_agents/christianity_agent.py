@@ -1,23 +1,31 @@
 """
-Christianity Agent — Main OpenAI Agents SDK agent for the AI assistant.
-Orchestrates the full conversation flow with guardrails, RAG, and safety.
+Christianity Agent — Single LangChain tool-calling agent with integrated guardrails and RAG.
 """
 
 from __future__ import annotations
 
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
-from loguru import logger
-from agents import Agent, Runner
 
-from prompts import load_system_prompt
-from tools.rag_tool import rag_tool, set_vector_db_context
-from tools.scripture_verify_tool import scripture_verify_tool
-from tools.image_gen_tool import image_gen_tool
-from custom_agents.guardrail_agent import run_guardrail, build_refusal_response, GuardrailDecision
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from loguru import logger
+
+from config.settings import get_settings
+from custom_agents.guardrail_agent import (
+    GuardrailDecision,
+    build_refusal_response,
+    parse_guardrail_refusal,
+)
+from llm.langchain_client import build_chat_model, detect_provider
 from memory.conversation_store import ConversationStore, ConversationTurn
 from moderation.safety_layer import post_process_safety
-from config.settings import get_settings
+from prompts import load_combined_prompt
+from tools.image_gen_tool import image_gen_tool
+from tools.rag_tool import rag_tool, set_vector_db_context
+from tools.scripture_verify_tool import scripture_verify_tool
 
 
 @dataclass
@@ -34,16 +42,85 @@ class AgentResponse:
     safety_warnings: list[str] = field(default_factory=list)
 
 
-# Create the main Christianity agent
-christianity_agent = Agent(
-    name="ChristianityAssistant",
-    instructions=load_system_prompt(),
-    tools=[rag_tool, scripture_verify_tool, image_gen_tool],
-    model="gpt-4o",
+_store = ConversationStore()
+
+# Trivial messages that never need knowledge-base grounding.
+_GREETING_RE = re.compile(
+    r"^(hi|hello|hey|yo|thanks|thank you|good (morning|evening|afternoon|night)|bye|goodbye)\b",
+    re.IGNORECASE,
 )
 
-# Conversation store singleton
-_store = ConversationStore()
+
+def _needs_rag(message: str) -> bool:
+    """Heuristic: does this message warrant knowledge-base grounding?"""
+    m = message.strip()
+    if len(m) < 3:
+        return False
+    if _GREETING_RE.match(m) and len(m.split()) <= 4:
+        return False
+    return True
+
+
+def _history_to_messages(conversation_id: str) -> list:
+    """Convert stored turns to LangChain message objects."""
+    conversation = _store.get_conversation(conversation_id)
+    if not conversation:
+        return []
+
+    messages = []
+    for turn in conversation.turns[-20:]:
+        if turn.role == "user":
+            messages.append(HumanMessage(content=turn.content))
+        elif turn.role == "assistant":
+            messages.append(AIMessage(content=turn.content))
+    return messages
+
+
+def _extract_tool_calls(messages: list) -> list[dict]:
+    """Collect tool names and inputs from agent message history (from AIMessage requests)."""
+    tool_calls_info = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_calls_info.append({
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("args", tc.get("arguments", "")),
+                })
+    return tool_calls_info
+
+
+def _log_agent_trace(messages: list) -> None:
+    """Emit a structured trace of the agent's reasoning steps for observability."""
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                logger.info(
+                    f"[agent] tool call -> {tc.get('name', '?')} "
+                    f"args={tc.get('args', tc.get('arguments', {}))}"
+                )
+        elif isinstance(msg, ToolMessage):
+            preview = str(msg.content)[:200].replace("\n", " ")
+            logger.info(
+                f"[agent] tool result <- {msg.name or '?'} "
+                f"({len(str(msg.content))} chars): {preview}"
+            )
+
+
+def _final_response_text(messages: list) -> str:
+    """Return the last assistant text response from the message list."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+            text = msg.content
+            if isinstance(text, str):
+                return text
+            if isinstance(text, list):
+                parts = [
+                    block.get("text", "")
+                    for block in text
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                return "".join(parts)
+    return ""
 
 
 async def run_christianity_agent(
@@ -56,155 +133,171 @@ async def run_christianity_agent(
     vector_db: Optional[str] = None,
 ) -> AgentResponse:
     """
-    Run the Christianity agent with full safety pipeline.
+    Run the single LangChain Christianity agent.
 
     Flow:
-    1. Run guardrail agent on user message
-    2. If blocked → return graceful refusal
-    3. Build context from conversation history
-    4. Run main agent with tools
-    5. Post-process safety check on output
-    6. Store conversation turn
-    7. Return structured response
-
-    Args:
-        user_message: The user's input message.
-        conversation_id: Unique conversation ID.
-        denomination: User's denomination for context.
-        model: LLM model to use.
-        use_rag: Whether to enable RAG search.
-        guardrail_model: Optional guardrail model.
-        vector_db: Vector DB to use ("qdrant" or "chroma"). Defaults to settings.
-
-    Returns:
-        AgentResponse with the agent's reply and metadata.
+    1. Build tools (RAG optional) and set vector DB context
+    2. Run agent with conversation history
+    3. Parse inline guardrail refusals
+    4. Post-process safety on output
+    5. Store conversation turn
     """
+    del guardrail_model  # single agent uses one model; kept for API compatibility
+
+    started = time.perf_counter()
     settings = get_settings()
-    # Override vector DB if specified
     effective_vector_db = vector_db or settings.default_vector_db
-    logger.info(f"Using vector DB: {effective_vector_db} (requested: {vector_db})")
+    provider = detect_provider(model, settings.default_llm_provider)
 
-    # Step 1: Run guardrail agent
-    if settings.enable_guardrail:
-        guardrail_result = await run_guardrail(user_message, model=guardrail_model)
-        if guardrail_result.blocked:
-            refusal = build_refusal_response(guardrail_result)
+    logger.info(
+        f"[agent] run start | conv={conversation_id} | provider={provider} | "
+        f"model={model} | denomination={denomination} | use_rag={use_rag} | "
+        f"vector_db={effective_vector_db}"
+    )
+    logger.debug(f"[agent] user_message: {user_message!r}")
 
-            # Store the blocked turn
-            _store.upsert_turn(conversation_id, ConversationTurn(
-                role="user",
-                content=user_message,
-                guardrail_triggered=True,
-                denomination_context=denomination,
-            ))
-            _store.upsert_turn(conversation_id, ConversationTurn(
-                role="assistant",
-                content=refusal["response"],
-                guardrail_triggered=True,
-            ))
-
-            return AgentResponse(
-                response=refusal["response"],
-                guardrail_triggered=True,
-                guardrail_category=guardrail_result.category,
-                model_used=model,
-                conversation_id=conversation_id,
-            )
-
-    # Step 2: Get conversation history
     conversation = _store.get_conversation(conversation_id)
     if conversation and conversation.denomination != denomination:
         conversation.denomination = denomination
 
-    # Build context-enriched input
-    context_prefix = f"[User denomination: {denomination}]\n[Vector DB: {effective_vector_db}]\n\n"
+    tools = [scripture_verify_tool, image_gen_tool]
+    if use_rag:
+        tools.insert(0, rag_tool)
+
+    set_vector_db_context(effective_vector_db)
+
+    tool_names = [getattr(t, "name", str(t)) for t in tools]
+    logger.info(f"[agent] tools bound: {tool_names}")
+
+    context_prefix = (
+        f"[User denomination: {denomination}]\n"
+        f"[Vector DB: {effective_vector_db}]\n"
+        f"[RAG enabled: {use_rag}. For ANY biblical, scriptural, or theological "
+        f"question you MUST call rag_tool first, then scripture_verify_tool before "
+        f"citing a specific verse.]\n\n"
+    )
     enriched_message = context_prefix + user_message
 
-    # Build conversation history for the agent
-    input_messages = []
-    if conversation:
-        for turn in conversation.turns[-20:]:  # Last 20 turns for context
-            input_messages.append({
-                "role": turn.role,
-                "content": turn.content,
-            })
+    chat_history = _history_to_messages(conversation_id)
+    system_prompt = load_combined_prompt()
 
-    input_messages.append({
-        "role": "user",
-        "content": enriched_message,
-    })
+    llm = build_chat_model(model, settings, provider)
+    agent_graph = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
 
-    # Step 3: Run the main agent
+    messages = [*chat_history, HumanMessage(content=enriched_message)]
+
     try:
-        # Update agent model if different from default
-        agent_to_run = christianity_agent
-        if model != "gpt-4o":
-            agent_to_run = Agent(
-                name="ChristianityAssistant",
-                instructions=load_system_prompt(),
-                tools=[rag_tool, scripture_verify_tool, image_gen_tool],
-                model=model,
+        result = await agent_graph.ainvoke({"messages": messages})
+        result_messages = result.get("messages", [])
+        _log_agent_trace(result_messages)
+        agent_response_text = _final_response_text(result_messages)
+        tool_calls_info = _extract_tool_calls(result_messages)
+        rag_used = any(t["name"] == "rag_tool" for t in tool_calls_info)
+
+        # Deterministic grounding fallback: if the model skipped RAG on a substantive
+        # question, retrieve from the knowledge base ourselves and re-run grounded.
+        if use_rag and not rag_used and _needs_rag(user_message):
+            logger.warning(
+                "[agent] model skipped rag_tool; running deterministic grounded retry"
+            )
+            try:
+                kb_context = await rag_tool.ainvoke(
+                    {"query": user_message, "top_k": 5}
+                )
+                grounding_msg = HumanMessage(content=(
+                    "Knowledge base results were retrieved for you. Use them as the "
+                    "primary source and cite the listed references:\n\n"
+                    f"{kb_context}"
+                ))
+                result2 = await agent_graph.ainvoke(
+                    {"messages": [*messages, grounding_msg]}
+                )
+                result_messages2 = result2.get("messages", [])
+                _log_agent_trace(result_messages2)
+                grounded_text = _final_response_text(result_messages2)
+                if grounded_text:
+                    agent_response_text = grounded_text
+                tool_calls_info.append(
+                    {"name": "rag_tool", "arguments": {"query": user_message}}
+                )
+                rag_used = True
+            except Exception:
+                logger.exception("[agent] grounded retry failed; using original answer")
+
+        if not agent_response_text:
+            logger.warning("[agent] empty final response from model")
+            agent_response_text = (
+                "I apologize, but I could not generate a response. Please try again."
             )
 
-        # Set the vector DB context for the rag_tool
-        set_vector_db_context(effective_vector_db)
-
-        result = await Runner.run(
-            agent_to_run,
-            input=input_messages,
-        )
-
-        agent_response_text = result.final_output
-
     except Exception as e:
-        logger.exception("Error running main agent: ")
+        logger.exception("[agent] error running LangChain agent:")
         agent_response_text = (
             "I apologize, but I encountered an issue processing your request. "
             f"Please try again. (Error: {str(e)[:100]})"
         )
         return AgentResponse(
             response=agent_response_text,
-            citations=[],
-            guardrail_triggered=False,
-            rag_used=False,
-            image_url=None,
             model_used=model,
             conversation_id=conversation_id,
-            safety_warnings=[],
         )
 
-    # Step 4: Post-process safety check
+    guardrail_decision: Optional[GuardrailDecision] = None
+    if settings.enable_guardrail:
+        agent_response_text, guardrail_decision = parse_guardrail_refusal(agent_response_text)
+
+    if guardrail_decision and guardrail_decision.blocked:
+        logger.warning(
+            f"[agent] guardrail refusal | category={guardrail_decision.category}"
+        )
+        refusal = build_refusal_response(guardrail_decision)
+        response_text = agent_response_text or refusal["response"]
+
+        _store.upsert_turn(conversation_id, ConversationTurn(
+            role="user",
+            content=user_message,
+            guardrail_triggered=True,
+            denomination_context=denomination,
+        ))
+        _store.upsert_turn(conversation_id, ConversationTurn(
+            role="assistant",
+            content=response_text,
+            guardrail_triggered=True,
+        ))
+
+        return AgentResponse(
+            response=response_text,
+            guardrail_triggered=True,
+            guardrail_category=guardrail_decision.category,
+            model_used=model,
+            conversation_id=conversation_id,
+        )
+
     safety_warnings = []
     if settings.enable_post_safety:
-        # Extract tool calls info for safety verification
-        tool_calls_info = []
-        if hasattr(result, 'raw_responses'):
-            for raw in result.raw_responses:
-                if hasattr(raw, 'output') and isinstance(raw.output, list):
-                    for item in raw.output:
-                        if hasattr(item, 'type') and item.type == 'tool_call':
-                            tool_calls_info.append({
-                                "name": getattr(item, 'name', ''),
-                                "arguments": getattr(item, 'arguments', ''),
-                            })
-
-        safety_result = await post_process_safety(
-            agent_response_text,
-            tool_calls_info,
-        )
-
+        safety_result = await post_process_safety(agent_response_text, tool_calls_info)
         if not safety_result.passed:
             safety_warnings = safety_result.warnings
-
+            logger.warning(f"[agent] post-safety warnings: {safety_warnings}")
         if safety_result.modified_response:
             agent_response_text = safety_result.modified_response
 
-    # Step 5: Extract citations and image URLs from the response
     citations = _extract_citations(agent_response_text)
     image_url = _extract_image_url(agent_response_text)
-    rag_used = _check_rag_used(agent_response_text)
+    rag_used = rag_used or _check_rag_used(agent_response_text)
 
-    # Step 6: Store conversation turns
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        f"[agent] run done | conv={conversation_id} | tool_calls="
+        f"{[t['name'] for t in tool_calls_info]} | rag_used={rag_used} | "
+        f"citations={len(citations)} | warnings={len(safety_warnings)} | "
+        f"image={'yes' if image_url else 'no'} | {elapsed_ms:.0f}ms"
+    )
+
     _store.upsert_turn(conversation_id, ConversationTurn(
         role="user",
         content=user_message,
@@ -231,9 +324,7 @@ async def run_christianity_agent(
 
 def _extract_citations(text: str) -> list[dict]:
     """Extract scripture citations from the agent response."""
-    import re
     citations = []
-    # Match patterns like (John 3:16, NIV) or (Genesis 1:1-3)
     pattern = re.compile(
         r'\((\d?\s*\w+(?:\s+\w+)?)\s+(\d+):(\d+)(?:-(\d+))?\s*(?:,\s*(\w+))?\)'
     )
@@ -253,14 +344,13 @@ def _extract_citations(text: str) -> list[dict]:
 
 def _extract_image_url(text: str) -> Optional[str]:
     """Extract generated image URL from the agent response."""
-    import re
     url_pattern = re.compile(r'https://[^\s]+\.png|https://oaidalleapiprodscus[^\s]+')
     match = url_pattern.search(text)
     return match.group(0) if match else None
 
 
 def _check_rag_used(text: str) -> bool:
-    """Check if RAG results were used in the response."""
+    """Check if RAG results appear in the response."""
     indicators = [
         "Knowledge Base Results",
         "[Source",

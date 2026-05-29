@@ -1,25 +1,25 @@
 """
-RAG Tool — Agent tool for searching the Bible and Christian theology knowledge base.
-Registered with the main Christianity agent via OpenAI Agents SDK.
+RAG Tool — LangChain tool for searching the Bible and Christian theology knowledge base.
 """
 
 from __future__ import annotations
 
 from contextvars import ContextVar
-from agents import function_tool
+
+from langchain_core.tools import tool
+from loguru import logger
 
 from rag.pipeline import search, format_search_results_for_context
 
-# Context variable to carry the selected vector DB into the tool call
 _current_vector_db: ContextVar[str] = ContextVar("current_vector_db", default="qdrant")
 
 
 def set_vector_db_context(vector_db: str) -> None:
-    """Set the vector DB for the current async context (call before Runner.run)."""
+    """Set the vector DB for the current async context (call before agent run)."""
     _current_vector_db.set(vector_db)
 
 
-@function_tool
+@tool
 async def rag_tool(
     query: str,
     top_k: int = 5,
@@ -28,34 +28,28 @@ async def rag_tool(
 ) -> str:
     """Search the Bible and Christian theology knowledge base.
 
-    CALL THIS TOOL when:
-    - User asks about a specific Bible verse or passage
-    - User asks about biblical events, characters, or teachings
-    - User asks theological questions that require scriptural grounding
-    - You need to verify a scripture reference before citing it
-
-    DO NOT call for general greetings or purely creative tasks with no factual claims.
+    Call when the user asks about scripture, biblical events, characters, teachings,
+    or theological questions that need knowledge-base grounding.
 
     Args:
         query: The search query text.
-        top_k: Number of results to return (default: 5).
-        testament: Optional filter: "Old" or "New" testament.
-        book: Optional filter: specific Bible book name (e.g., "John", "Genesis").
-
-    Returns:
-        Formatted context with citations from the knowledge base.
+        top_k: Number of results to return (default 5).
+        testament: Optional filter — "Old" or "New".
+        book: Optional filter — Bible book name (e.g. "John", "Genesis").
     """
-    # Build filter conditions from metadata
     filter_conditions = {}
     if testament:
         filter_conditions["testament"] = testament
     if book:
         filter_conditions["book"] = book
 
-    # Read the vector DB set by the current request context
     vector_db = _current_vector_db.get()
 
-    # Perform hybrid search
+    logger.info(
+        f"[rag_tool] query={query!r} | top_k={top_k} | db={vector_db} | "
+        f"filters={filter_conditions or '{}'}"
+    )
+
     results = await search(
         query=query,
         top_k=top_k,
@@ -63,14 +57,16 @@ async def rag_tool(
         filter_conditions=filter_conditions if filter_conditions else None,
     )
 
+    logger.info(f"[rag_tool] retrieved {len(results)} passage(s)")
+
     if not results:
+        logger.warning(f"[rag_tool] no results for query={query!r}")
         return (
             "No relevant passages found in the knowledge base for this query. "
             "You may need to answer from general theological knowledge, but be "
             "transparent about the lack of specific knowledge base grounding."
         )
 
-    # Format results with citations
     formatted = format_search_results_for_context(results)
 
     return (

@@ -1,32 +1,30 @@
 """
-Guardrail Agent — Lightweight safety classifier using OpenAI Agents SDK.
-Runs on EVERY user message BEFORE the main agent processes it.
-Uses gpt-4o-mini for speed and cost efficiency.
+Guardrail helpers — parse inline refusals from the single LangChain agent.
 """
 
 from __future__ import annotations
 
-import json
+import re
 from dataclasses import dataclass
 from typing import Optional
-from loguru import logger
 
-from agents import Agent, Runner
-
-from prompts import load_guardrail_prompt
 from moderation.safety_layer import REFUSAL_MESSAGES
+
+GUARDRAIL_REFUSAL_PATTERN = re.compile(
+    r"^\[GUARDRAIL_REFUSAL:([a-z_]+)\]\s*\n?",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 @dataclass
 class GuardrailDecision:
-    """Decision from the guardrail agent."""
+    """Decision from an inline guardrail refusal."""
     blocked: bool
     reason: Optional[str] = None
     category: Optional[str] = None
-    confidence: float = 0.0
+    confidence: float = 1.0
 
 
-# Categories recognized by the guardrail agent
 GUARDRAIL_CATEGORIES = [
     "hate_speech",
     "fake_scripture_injection",
@@ -35,96 +33,36 @@ GUARDRAIL_CATEGORIES = [
     "ideology_manipulation",
     "image_violation",
     "off_topic_harmful",
-    "any_other_topic_except_bible"
+    "any_other_topic_except_bible",
 ]
 
 
-# Create the guardrail agent
-guardrail_agent = Agent(
-    name="GuardrailClassifier",
-    instructions=load_guardrail_prompt(),
-    model="gpt-4o-mini",
-)
-
-
-async def run_guardrail(user_message: str, model: Optional[str] = None) -> GuardrailDecision:
+def parse_guardrail_refusal(response_text: str) -> tuple[str, Optional[GuardrailDecision]]:
     """
-    Run the guardrail agent on a user message.
-
-    Args:
-        user_message: The user's input message.
-        model: Optional dynamic model name.
+    Strip an inline guardrail marker and return cleaned text plus decision.
 
     Returns:
-        GuardrailDecision indicating whether the message should be blocked.
+        (cleaned_response, decision) — decision is None if not a guardrail refusal.
     """
-    logger.info(f"Running guardrail classification on user message...")
-    try:
-        agent_to_run = guardrail_agent
-        if model and model != "gpt-4o-mini":
-            logger.info(f"Dynamically instantiating guardrail agent with model: {model}")
-            agent_to_run = Agent(
-                name="GuardrailClassifier",
-                instructions=load_guardrail_prompt(),
-                model=model,
-            )
+    match = GUARDRAIL_REFUSAL_PATTERN.search(response_text)
+    if not match:
+        return response_text, None
 
-        result = await Runner.run(
-            agent_to_run,
-            input=f"Evaluate this user message:\n\n{user_message}",
-        )
+    category = match.group(1).lower()
+    cleaned = GUARDRAIL_REFUSAL_PATTERN.sub("", response_text, count=1).strip()
 
-        # Parse the JSON response
-        response_text = result.final_output.strip()
-
-        # Try to extract JSON from the response
-        try:
-            # Handle case where response has markdown code blocks
-            if "```" in response_text:
-                json_start = response_text.find("{")
-                json_end = response_text.rfind("}") + 1
-                if json_start >= 0 and json_end > json_start:
-                    response_text = response_text[json_start:json_end]
-
-            data = json.loads(response_text)
-            blocked = data.get("blocked", False)
-            reason = data.get("reason")
-            category = data.get("category")
-            confidence = data.get("confidence", 0.0)
-
-            logger.info(f"Guardrail check complete. Blocked: {blocked}, Reason: {reason}, Category: {category}")
-
-            return GuardrailDecision(
-                blocked=blocked,
-                reason=reason,
-                category=category,
-                confidence=confidence,
-            )
-        except json.JSONDecodeError:
-            # If we can't parse the response, default to allowing
-            logger.warning(f"Failed to parse guardrail JSON response: {response_text}. Defaulting to allow.")
-            return GuardrailDecision(blocked=False, confidence=0.0)
-
-    except Exception as e:
-        # If guardrail fails, default to allowing (fail open)
-        # but log the error
-        logger.exception("Guardrail agent error occurred: ")
-        return GuardrailDecision(blocked=False, reason=f"Guardrail error: {str(e)}")
+    return cleaned, GuardrailDecision(
+        blocked=True,
+        category=category,
+        reason=f"Blocked by integrated guardrail ({category})",
+        confidence=1.0,
+    )
 
 
 def build_refusal_response(decision: GuardrailDecision) -> dict:
-    """
-    Build a graceful refusal response based on the guardrail decision.
-
-    Args:
-        decision: The guardrail decision with category and reason.
-
-    Returns:
-        Dict with response text and metadata.
-    """
+    """Build API metadata for a guardrail refusal."""
     category = decision.category or "general"
 
-    # Get the appropriate refusal message
     refusal_map = {
         "hate_speech": REFUSAL_MESSAGES["hate_speech"],
         "fake_scripture_injection": REFUSAL_MESSAGES["fake_scripture"],

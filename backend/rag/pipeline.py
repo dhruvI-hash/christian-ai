@@ -50,6 +50,11 @@ async def search(
     collection = collection or settings.default_collection
     vector_db = vector_db or settings.default_vector_db
 
+    logger.info(
+        f"[rag.search] collection={collection} | db={vector_db} | "
+        f"top_k={top_k} | filters={filter_conditions or '{}'} | query={query!r}"
+    )
+
     # Generate query embeddings
     dense_vector = embed_text(query)
     sparse_vector = compute_sparse_vector(query)
@@ -88,6 +93,7 @@ async def search(
             filter_conditions=filter_conditions,
         )
 
+    logger.info(f"[rag.search] returned {len(results)} result(s) from {vector_db}")
     return results
 
 

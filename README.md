@@ -10,8 +10,8 @@ A production-grade, full-stack AI assistant specializing in Christianity, Bible 
 |---|---|
 | **Frontend** | Next.js 14 (App Router) + React 18 + TypeScript + TailwindCSS |
 | **Backend** | Python 3.11 + FastAPI |
-| **Agent Framework** | OpenAI Agents SDK (`openai-agents`) |
-| **LLM Providers** | OpenAI GPT-4o, Google Gemini 2.0, Ollama (local) |
+| **Agent Framework** | LangChain agents (`create_agent`) — single tool-calling agent |
+| **LLM Providers** | OpenAI GPT-4o, Google Gemini (native), Ollama (local), OpenRouter |
 | **Embeddings** | `sentence-transformers` — `all-MiniLM-L6-v2` (384d) |
 | **Sparse Search** | BM25 via `rank_bm25` |
 | **Vector DBs** | Qdrant Cloud + ChromaDB |
@@ -72,8 +72,8 @@ Copy `.env.example` to `.env` and fill in your API keys. See the file for all av
 ```
 christianity-ai/
 ├── backend/          # Python / FastAPI
-│   ├── agents/       # OpenAI Agents SDK agents
-│   ├── tools/        # Agent tools (RAG, scripture verify, image gen)
+│   ├── custom_agents/ # LangChain single-agent orchestration + guardrail parsing
+│   ├── tools/        # LangChain tools (RAG, scripture verify, image gen)
 │   ├── rag/          # Full RAG pipeline (embed, chunk, search)
 │   ├── vectordb/     # Qdrant + ChromaDB clients
 │   ├── llm/          # Multi-provider LLM router

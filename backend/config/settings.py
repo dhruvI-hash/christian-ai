@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     enable_guardrail: bool = True
     enable_post_safety: bool = True
 
+    # --- Observability ---
+    log_level: str = "INFO"
+
     # --- RAG ---
     chunk_size: int = 512
     chunk_overlap: int = 128

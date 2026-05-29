@@ -50,15 +50,21 @@ ChristianAI is a production-grade, full-stack AI assistant specializing in Chris
 
 ### Chat Request (`POST /api/chat`)
 
-1. **Input Guardrail** — Lightweight gpt-4o-mini agent classifies message safety
-2. **If blocked** → Return graceful refusal message (no agent invocation)
-3. **Main Agent** — OpenAI Agents SDK agent processes with tools:
+1. **Single LangChain Agent** — `create_agent` runs one tool-calling agent whose
+   system prompt embeds the guardrail policy (refusals are emitted inline and parsed):
    - `rag_tool` — Hybrid search the knowledge base
    - `scripture_verify_tool` — Verify Bible references before citing
    - `image_gen_tool` — Generate images via DALL-E 3 with safety filter
+2. **Deterministic RAG fallback** — If the model skips `rag_tool` on a substantive
+   question, the backend invokes `rag_tool` itself and re-runs the agent grounded,
+   guaranteeing knowledge-base grounding regardless of model strength.
+3. **Guardrail parsing** — Inline `[GUARDRAIL_REFUSAL:category]` markers become a
+   graceful refusal response (no citations).
 4. **Output Safety** — Scan response for unverified citations
 5. **Memory** — Store conversation turn with metadata
 6. **Response** — Return structured JSON with citations, safety flags
+7. **Observability** — Every step (provider/model, tool calls, tool results, RAG hits,
+   timings, warnings) is logged via loguru.
 
 ### RAG Pipeline
 

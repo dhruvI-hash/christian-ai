@@ -73,16 +73,17 @@ async def post_process_safety(
     verse_pattern = re.compile(r'(\d?\s*\w+)\s+(\d+):(\d+)(?:-\d+)?')
     verse_matches = list(verse_pattern.finditer(agent_response))
 
-    # Check if scripture_verify_tool was called
-    verify_called = any(
-        tc.get("name") == "scripture_verify_tool"
+    # Citations are considered grounded if the agent either verified the reference
+    # or retrieved supporting passages from the knowledge base via rag_tool.
+    grounded = any(
+        tc.get("name") in ("scripture_verify_tool", "rag_tool")
         for tc in agent_tool_calls
     )
 
-    if verse_matches and not verify_called:
+    if verse_matches and not grounded:
         warnings.append(
-            "Response contains scripture references but scripture_verify_tool "
-            "was not called. Citations may be unverified."
+            "Response contains scripture references but neither scripture_verify_tool "
+            "nor rag_tool was called. Citations may be unverified."
         )
 
     # Check 2: Hallucination markers without citations

@@ -6,7 +6,7 @@ This guide will help you get the full-stack Christianity-focused AI Assistant mo
 
 ## 🏗️ Architecture & Requirements
 
-- **Backend**: Python 3.11+ (FastAPI, OpenAI Agents SDK)
+- **Backend**: Python 3.11+ (FastAPI, LangChain agents)
 - **Frontend**: Next.js 14 (React, TypeScript, TailwindCSS)
 - **Vector DBs**: ChromaDB (dense search, runs locally) and Qdrant (dense + sparse search)
 - **Embeddings**: `sentence-transformers` (`all-MiniLM-L6-v2`)
@@ -21,7 +21,7 @@ This guide will help you get the full-stack Christianity-focused AI Assistant mo
    cp .env.example .env
    ```
 3. Open your new `.env` file and insert your API keys:
-   - **`OPENAI_API_KEY`**: Required for OpenAI Agents SDK (`gpt-4o`, `gpt-4o-mini`, DALL-E 3).
+   - **`OPENAI_API_KEY`**: Required for LangChain/OpenAI models (`gpt-4o`, `gpt-4o-mini`, DALL-E 3).
    - **`GEMINI_API_KEY`**: Optional - for Google Gemini integration.
    - **`QDRANT_URL` & `QDRANT_API_KEY`**: Optional - if using Qdrant Cloud or external servers. (ChromaDB runs locally automatically).
 
@@ -46,7 +46,7 @@ The backend serves the FastAPI server, runs the guardrails, manages scripture ve
    # Activate on macOS/Linux
    source .venv/bin/activate
    ```
-3. Install the dependencies:
+3. Install dependencies into this venv (not global Python):
    ```bash
    pip install -r requirements.txt
    ```
@@ -114,5 +114,6 @@ Open your browser to the local frontend port (e.g., **`http://localhost:3002`**)
 ## 🛠️ Troubleshooting & Support
 
 - **CORS Errors**: If you encounter network errors, ensure the backend is running at `http://127.0.0.1:8000` and the frontend origin (e.g., `http://localhost:3002`) is correctly whitelisted in [main.py](file:///c:/Users/kashy/OneDrive/Desktop/Dhruvi/assignment1/christianity-ai/backend/main.py#L55-L68).
-- **Import Errors (`from agents import Agent`)**: If local files shadow the third-party `openai-agents` package, make sure you are importing custom agents from `custom_agents` (e.g. `from custom_agents.christianity_agent import ...`).
+- **Wrong Python environment**: Always activate `backend/.venv` before running the server. In VS Code/Cursor, set the interpreter to `backend/.venv/Scripts/python.exe`.
+- **Global package conflicts**: Use the project venv only (`pip install -r requirements.txt` inside `backend/.venv`), not your system Anaconda environment.
 - **Ollama Local LLM**: If selecting Ollama models, ensure your local Ollama server is running (`ollama serve`) and the relevant models (`qwen3.5:4b`, `granite3.1:3b`) are pulled.
